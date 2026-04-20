@@ -2,16 +2,16 @@
 """
 Mininet Topology for ARP Handling in SDN Networks
 ==================================================
-Topology: 4 hosts connected to a single OVS switch
-          controlled by a remote Ryu controller.
+Controller: POX (OpenFlow 1.0)
 
-         h1 (10.0.0.1)
-          |
-h4 ------S1------ h2
-          |
-         h3 (10.0.0.3)
+NOTE: POX uses OpenFlow 1.0, so the switch protocol is set to OpenFlow10.
 
 Usage:
+    # Terminal 1 — start POX controller first
+    cd ~/pox
+    python3 pox.py log.level --DEBUG misc.arp_handler
+
+    # Terminal 2 — start topology
     sudo python3 topology.py
 """
 
@@ -24,17 +24,13 @@ import time
 
 
 def build_topology():
-    """
-    Build a simple 4-host single-switch topology and start
-    with a remote Ryu controller listening on 127.0.0.1:6633.
-    """
     setLogLevel('info')
 
     net = Mininet(
         controller=RemoteController,
         switch=OVSSwitch,
         link=TCLink,
-        autoSetMacs=True    # Assign deterministic MACs (00:00:00:00:00:01 etc.)
+        autoSetMacs=True
     )
 
     info("*** Creating controller\n")
@@ -42,11 +38,12 @@ def build_topology():
         'c0',
         controller=RemoteController,
         ip='127.0.0.1',
-        port=6633
+        port=6633          # POX default port
     )
 
     info("*** Creating switch\n")
-    s1 = net.addSwitch('s1', protocols='OpenFlow13')
+    # POX uses OpenFlow 1.0
+    s1 = net.addSwitch('s1', protocols='OpenFlow10')
 
     info("*** Creating hosts\n")
     h1 = net.addHost('h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01')
@@ -65,7 +62,7 @@ def build_topology():
     c0.start()
     s1.start([c0])
 
-    info("*** Waiting for controller to be ready (3s)\n")
+    info("*** Waiting for controller (3s)\n")
     time.sleep(3)
 
     info("\n" + "=" * 60 + "\n")
@@ -74,8 +71,6 @@ def build_topology():
     info("  h2: 10.0.0.2  MAC: 00:00:00:00:00:02\n")
     info("  h3: 10.0.0.3  MAC: 00:00:00:00:00:03\n")
     info("  h4: 10.0.0.4  MAC: 00:00:00:00:00:04\n")
-    info("=" * 60 + "\n")
-    info("Run tests with:  test_scenarios.py  OR  use CLI below\n")
     info("=" * 60 + "\n")
 
     CLI(net)

@@ -1,349 +1,299 @@
 """
-ARP Handling in SDN Networks - Ryu Controller
-=============================================
+ARP Handling in SDN Networks - POX Controller
+==============================================
 Problem: ARP requests flood the network causing inefficiency.
 Solution: SDN controller intercepts ARP packets, maintains an ARP table,
           generates ARP replies directly, and installs proactive flow rules.
 
 Author: SDN Project
-Controller: Ryu OpenFlow 1.3
+Controller: POX (OpenFlow 1.0)
+
+Usage:
+    cd ~/pox
+    python3 pox.py log.level --DEBUG misc.arp_handler
+    (place this file in ~/pox/pox/misc/arp_handler.py)
 """
 
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp, ipv4
-from ryu.lib.packet import ether_types
-import logging
+from pox.core import core
+from pox.lib.util import dpidToStr
+from pox.lib.addresses import IPAddr, EthAddr
+import pox.openflow.libopenflow_01 as of
+from pox.lib.packet import ethernet, arp, ipv4
+from pox.lib.packet.ethernet import ethernet as eth_type
+import pox.lib.packet as pkt
+
+log = core.getLogger()
 
 
-class ARPHandler(app_manager.RyuApp):
+class ARPHandler(object):
     """
-    SDN ARP Handler Controller
+    POX SDN ARP Handler
 
     This controller:
-    1. Intercepts all ARP requests via packet_in events
+    1. Intercepts all ARP requests via PacketIn events
     2. Maintains a centralized ARP table (IP -> MAC mapping)
-    3. Generates ARP replies on behalf of destination hosts
+    3. Generates ARP replies on behalf of destination hosts (proxy ARP)
     4. Installs proactive flow rules for unicast traffic
     5. Prevents ARP flooding by handling replies at the controller
     """
 
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    def __init__(self, connection):
+        self.connection = connection
 
-    def __init__(self, *args, **kwargs):
-        super(ARPHandler, self).__init__(*args, **kwargs)
-
-        # ARP Table: maps IP address -> (MAC address, datapath_id, port)
+        # ARP Table: IP (string) -> (EthAddr, port)
         self.arp_table = {}
 
-        # MAC Table: maps (datapath_id, MAC) -> output_port  (for L2 forwarding)
+        # MAC Table: MAC (string) -> port
         self.mac_to_port = {}
 
-        self.logger.setLevel(logging.INFO)
-        self.logger.info("=" * 60)
-        self.logger.info("ARP Handler SDN Controller Started")
-        self.logger.info("=" * 60)
+        # Listen to PacketIn and ConnectionDown events
+        connection.addListeners(self)
+
+        log.info("Switch %s connected — installing table-miss rule",
+                 dpidToStr(connection.dpid))
+        self._install_table_miss()
 
     # ------------------------------------------------------------------ #
-    #  Switch Handshake – install table-miss entry                        #
+    #  Table-Miss Rule                                                    #
     # ------------------------------------------------------------------ #
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
+    def _install_table_miss(self):
         """
-        Called when a new switch connects.
-        Installs a low-priority table-miss rule so unmatched packets
-        are forwarded to the controller via packet_in.
+        Install a low-priority catch-all rule so every unmatched packet
+        is sent to the controller via PacketIn.
         """
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        self.logger.info("[SWITCH] Connected: dpid=%016x", datapath.id)
-
-        # Table-miss: match everything, priority 0, send to controller
-        match = parser.OFPMatch()
-        actions = [
-            parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                   ofproto.OFPCML_NO_BUFFER)
-        ]
-        self._add_flow(datapath, priority=0, match=match, actions=actions)
+        msg = of.ofp_flow_mod()
+        msg.priority = 0
+        msg.match = of.ofp_match()          # Match everything
+        msg.actions.append(
+            of.ofp_action_output(port=of.OFPP_CONTROLLER)
+        )
+        self.connection.send(msg)
 
     # ------------------------------------------------------------------ #
-    #  Packet-In Handler                                                  #
+    #  PacketIn Handler                                                   #
     # ------------------------------------------------------------------ #
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
+    def _handle_PacketIn(self, event):
         """
-        Main packet handler.
-        - ARP requests  → generate reply from controller ARP table
-        - ARP replies   → update ARP table; install flow rules
-        - IPv4 packets  → standard L2 forwarding
+        Main packet handler — called for every packet_in event.
+        Routes ARP and IPv4 packets to their respective handlers.
         """
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
+        packet_in = event.ofp          # Raw OpenFlow PacketIn message
+        parsed   = event.parsed        # Parsed packet
+        in_port  = event.port
 
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-
-        if eth is None:
+        if not parsed.parsed:
+            log.warning("Ignoring unparsed packet")
             return
 
-        eth_type = eth.ethertype
-        dst_mac = eth.dst
-        src_mac = eth.src
-        dpid = datapath.id
+        src_mac = parsed.src            # EthAddr
+        dst_mac = parsed.dst
 
-        # Learn source MAC -> port mapping
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src_mac] = in_port
+        # Learn MAC -> port
+        self.mac_to_port[str(src_mac)] = in_port
 
-        # ---- ARP Handling -------------------------------------------- #
-        arp_pkt = pkt.get_protocol(arp.arp)
+        # ---- ARP ---------------------------------------------------- #
+        arp_pkt = parsed.find('arp')
         if arp_pkt:
-            self._handle_arp(datapath, in_port, eth, arp_pkt, msg)
+            self._handle_arp(event, parsed, arp_pkt, in_port)
             return
 
-        # ---- IPv4 Forwarding ----------------------------------------- #
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        # ---- IPv4 --------------------------------------------------- #
+        ip_pkt = parsed.find('ipv4')
         if ip_pkt:
-            self._handle_ipv4(datapath, in_port, eth, ip_pkt, msg)
+            self._handle_ipv4(event, parsed, ip_pkt, in_port)
             return
 
     # ------------------------------------------------------------------ #
     #  ARP Processing                                                     #
     # ------------------------------------------------------------------ #
-    def _handle_arp(self, datapath, in_port, eth, arp_pkt, msg):
+    def _handle_arp(self, event, parsed, arp_pkt, in_port):
         """
         Handle ARP packets:
-          - ARP_REQUEST: look up ARP table; if known, reply immediately.
-          - ARP_REPLY:   update ARP table; install bidirectional flow rules.
+          ARP_REQUEST → if destination known, reply from controller (proxy).
+                        if unknown, flood.
+          ARP_REPLY   → update ARP table; forward to requester; install flows.
         """
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        dpid = datapath.id
-
-        src_ip = arp_pkt.src_ip
-        dst_ip = arp_pkt.dst_ip
-        src_mac = arp_pkt.src_mac
+        src_ip  = str(arp_pkt.protosrc)   # e.g. "10.0.0.1"
+        dst_ip  = str(arp_pkt.protodst)
+        src_mac = arp_pkt.hwsrc           # EthAddr
 
         # Always learn the sender
-        self.arp_table[src_ip] = (src_mac, dpid, in_port)
-        self.logger.info("[ARP  ] Learned  %-15s -> %s  (dpid=%016x port=%s)",
-                         src_ip, src_mac, dpid, in_port)
+        self.arp_table[src_ip] = (src_mac, in_port)
+        log.info("[ARP  ] Learned  %-15s -> %s  (port %s)",
+                 src_ip, src_mac, in_port)
 
-        # ---- ARP Request --------------------------------------------- #
-        if arp_pkt.opcode == arp.ARP_REQUEST:
-            self.logger.info("[ARP  ] REQUEST  who-has %-15s tell %s (%s)",
-                             dst_ip, src_ip, src_mac)
+        # ---- ARP Request -------------------------------------------- #
+        if arp_pkt.opcode == arp.REQUEST:
+            log.info("[ARP  ] REQUEST  who-has %-15s tell %s (%s)",
+                     dst_ip, src_ip, src_mac)
 
             if dst_ip in self.arp_table:
-                # We know the destination: generate a gratuitous reply
-                dst_mac_known, _, _ = self.arp_table[dst_ip]
-                self.logger.info(
-                    "[ARP  ] REPLY    %-15s is-at %s  (controller proxy)",
+                dst_mac_known, _ = self.arp_table[dst_ip]
+                log.info(
+                    "[ARP  ] PROXY REPLY  %-15s is-at %s  (controller)",
                     dst_ip, dst_mac_known)
                 self._send_arp_reply(
-                    datapath, in_port,
-                    src_ip=dst_ip, src_mac=dst_mac_known,
-                    dst_ip=src_ip, dst_mac=src_mac
+                    in_port,
+                    src_ip=dst_ip,  src_mac=dst_mac_known,
+                    dst_ip=src_ip,  dst_mac=src_mac
                 )
             else:
-                # Unknown destination: flood the ARP request
-                self.logger.info(
-                    "[ARP  ] FLOOD    %-15s not in table yet", dst_ip)
-                self._flood(datapath, msg)
+                log.info("[ARP  ] FLOOD    %-15s not in table yet", dst_ip)
+                self._flood(event)
 
-        # ---- ARP Reply ----------------------------------------------- #
-        elif arp_pkt.opcode == arp.ARP_REPLY:
-            self.logger.info("[ARP  ] REPLY    %-15s is-at %s", src_ip, src_mac)
+        # ---- ARP Reply ---------------------------------------------- #
+        elif arp_pkt.opcode == arp.REPLY:
+            log.info("[ARP  ] REPLY    %-15s is-at %s", src_ip, src_mac)
 
-            # Forward the reply to the requester if we know their port
-            dst_mac = eth.dst
-            if dst_mac in self.mac_to_port.get(dpid, {}):
-                out_port = self.mac_to_port[dpid][dst_mac]
-                self._send_packet(datapath, out_port, msg)
+            dst_mac = parsed.dst
+            dst_mac_str = str(dst_mac)
 
-                # Install proactive flow rules for both directions
-                dst_ip_known = arp_pkt.dst_ip
-                if dst_ip_known in self.arp_table:
-                    _, dst_dpid, dst_port = self.arp_table[dst_ip_known]
-                    # src -> dst flow
+            if dst_mac_str in self.mac_to_port:
+                out_port = self.mac_to_port[dst_mac_str]
+                self._send_packet(event.ofp, out_port)
+
+                # Install bidirectional IP flow rules
+                dst_ip_str = str(arp_pkt.protodst)
+                if dst_ip_str in self.arp_table:
                     self._install_flow_pair(
-                        datapath, src_ip, dst_ip_known,
-                        src_mac, dst_mac, out_port
+                        src_ip, dst_ip_str,
+                        src_mac, dst_mac,
+                        in_port, out_port
                     )
-                    self.logger.info(
-                        "[FLOW ] Installed flow %s -> %s", src_ip, dst_ip_known)
             else:
-                self._flood(datapath, msg)
+                self._flood(event)
 
     # ------------------------------------------------------------------ #
     #  IPv4 Forwarding                                                    #
     # ------------------------------------------------------------------ #
-    def _handle_ipv4(self, datapath, in_port, eth, ip_pkt, msg):
+    def _handle_ipv4(self, event, parsed, ip_pkt, in_port):
         """Standard L2 forwarding for IPv4 packets."""
-        dpid = datapath.id
-        dst_mac = eth.dst
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        dst_mac     = parsed.dst
+        dst_mac_str = str(dst_mac)
 
-        if dst_mac in self.mac_to_port.get(dpid, {}):
-            out_port = self.mac_to_port[dpid][dst_mac]
+        if dst_mac_str in self.mac_to_port:
+            out_port = self.mac_to_port[dst_mac_str]
+
+            # Install L2 flow rule
+            msg = of.ofp_flow_mod()
+            msg.priority    = 10
+            msg.idle_timeout = 30
+            msg.hard_timeout = 120
+            msg.match        = of.ofp_match.from_packet(parsed, in_port)
+            msg.actions.append(of.ofp_action_output(port=out_port))
+            msg.data         = event.ofp
+            self.connection.send(msg)
         else:
-            out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # Install a flow rule if we know the exact port
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(
-                in_port=in_port,
-                eth_dst=dst_mac,
-                eth_src=eth.src
-            )
-            self._add_flow(datapath, priority=10, match=match, actions=actions,
-                           idle_timeout=30, hard_timeout=120)
-
-        self._send_packet(datapath, out_port, msg)
+            self._flood(event)
 
     # ------------------------------------------------------------------ #
-    #  Helper: Generate ARP Reply Packet                                  #
+    #  Helper: Generate and Send ARP Reply                               #
     # ------------------------------------------------------------------ #
-    def _send_arp_reply(self, datapath, out_port,
-                        src_ip, src_mac, dst_ip, dst_mac):
+    def _send_arp_reply(self, out_port, src_ip, src_mac, dst_ip, dst_mac):
         """
-        Construct and send an ARP reply packet out of the specified port.
+        Build an ARP reply packet and send it out of out_port.
+        src_* = the host being queried (the one we're replying ON BEHALF OF)
+        dst_* = the host that sent the ARP request (receives the reply)
         """
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        # Build ARP layer
+        arp_reply        = arp()
+        arp_reply.opcode  = arp.REPLY
+        arp_reply.hwsrc   = EthAddr(src_mac)
+        arp_reply.hwdst   = EthAddr(dst_mac)
+        arp_reply.protosrc = IPAddr(src_ip)
+        arp_reply.protodst = IPAddr(dst_ip)
 
-        # Build Ethernet + ARP reply
-        pkt = packet.Packet()
-        pkt.add_protocol(ethernet.ethernet(
-            ethertype=ether_types.ETH_TYPE_ARP,
-            dst=dst_mac,
-            src=src_mac
-        ))
-        pkt.add_protocol(arp.arp(
-            opcode=arp.ARP_REPLY,
-            src_mac=src_mac,
-            src_ip=src_ip,
-            dst_mac=dst_mac,
-            dst_ip=dst_ip
-        ))
-        pkt.serialize()
+        # Build Ethernet layer
+        eth_frame       = ethernet()
+        eth_frame.type  = ethernet.ARP_TYPE
+        eth_frame.src   = EthAddr(src_mac)
+        eth_frame.dst   = EthAddr(dst_mac)
+        eth_frame.payload = arp_reply
 
-        actions = [parser.OFPActionOutput(out_port)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=pkt.data
-        )
-        datapath.send_msg(out)
+        # Send as PacketOut
+        msg         = of.ofp_packet_out()
+        msg.data    = eth_frame.pack()
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        msg.in_port = of.OFPP_NONE
+        self.connection.send(msg)
 
     # ------------------------------------------------------------------ #
-    #  Helper: Install Bidirectional Flow Rules                           #
+    #  Helper: Install Bidirectional Flow Rules                          #
     # ------------------------------------------------------------------ #
-    def _install_flow_pair(self, datapath, src_ip, dst_ip,
-                           src_mac, dst_mac, dst_port):
+    def _install_flow_pair(self, src_ip, dst_ip,
+                           src_mac, dst_mac,
+                           src_port, dst_port):
         """
-        Install match-action flow rules for both src->dst and dst->src.
+        Install match-action IP flow rules in both directions.
+        Priority 20, idle timeout 60s, hard timeout 300s.
         """
-        parser = datapath.ofproto_parser
-        dpid = datapath.id
+        # Forward: src -> dst
+        msg_fwd = of.ofp_flow_mod()
+        msg_fwd.priority     = 20
+        msg_fwd.idle_timeout = 60
+        msg_fwd.hard_timeout = 300
+        msg_fwd.match        = of.ofp_match()
+        msg_fwd.match.dl_type  = 0x0800          # IPv4
+        msg_fwd.match.nw_src   = IPAddr(src_ip)
+        msg_fwd.match.nw_dst   = IPAddr(dst_ip)
+        msg_fwd.actions.append(of.ofp_action_output(port=dst_port))
+        self.connection.send(msg_fwd)
 
-        # Forward direction: src -> dst
-        if src_mac in self.mac_to_port.get(dpid, {}):
-            src_port = self.mac_to_port[dpid][src_mac]
-            match_fwd = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip
-            )
-            actions_fwd = [parser.OFPActionOutput(dst_port)]
-            self._add_flow(datapath, priority=20, match=match_fwd,
-                           actions=actions_fwd,
-                           idle_timeout=60, hard_timeout=300)
+        # Reverse: dst -> src
+        msg_rev = of.ofp_flow_mod()
+        msg_rev.priority     = 20
+        msg_rev.idle_timeout = 60
+        msg_rev.hard_timeout = 300
+        msg_rev.match        = of.ofp_match()
+        msg_rev.match.dl_type  = 0x0800
+        msg_rev.match.nw_src   = IPAddr(dst_ip)
+        msg_rev.match.nw_dst   = IPAddr(src_ip)
+        msg_rev.actions.append(of.ofp_action_output(port=src_port))
+        self.connection.send(msg_rev)
 
-        # Reverse direction: dst -> src
-        if dst_mac in self.mac_to_port.get(dpid, {}):
-            rev_port = self.mac_to_port[dpid][src_mac]
-            match_rev = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=dst_ip,
-                ipv4_dst=src_ip
-            )
-            actions_rev = [parser.OFPActionOutput(rev_port)]
-            self._add_flow(datapath, priority=20, match=match_rev,
-                           actions=actions_rev,
-                           idle_timeout=60, hard_timeout=300)
+        log.info("[FLOW ] Installed flow %s <-> %s", src_ip, dst_ip)
 
     # ------------------------------------------------------------------ #
-    #  Helper: Add Flow Rule                                              #
+    #  Helper: Flood                                                     #
     # ------------------------------------------------------------------ #
-    def _add_flow(self, datapath, priority, match, actions,
-                  idle_timeout=0, hard_timeout=0):
-        """
-        Install a flow rule on the switch.
-        """
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        inst = [parser.OFPInstructionActions(
-            ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=priority,
-            match=match,
-            instructions=inst,
-            idle_timeout=idle_timeout,
-            hard_timeout=hard_timeout
-        )
-        datapath.send_msg(mod)
-
-    # ------------------------------------------------------------------ #
-    #  Helper: Flood Packet                                               #
-    # ------------------------------------------------------------------ #
-    def _flood(self, datapath, msg):
+    def _flood(self, event):
         """Send packet out all ports except the one it arrived on."""
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
-
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        )
-        datapath.send_msg(out)
+        msg         = of.ofp_packet_out()
+        msg.data    = event.ofp
+        msg.in_port = event.port
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+        self.connection.send(msg)
 
     # ------------------------------------------------------------------ #
-    #  Helper: Send Packet Out                                            #
+    #  Helper: Send Packet Out (unicast)                                 #
     # ------------------------------------------------------------------ #
-    def _send_packet(self, datapath, out_port, msg):
-        """Forward a buffered or unbuffered packet to a specific port."""
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
+    def _send_packet(self, packet_in, out_port):
+        """Forward a packet to a specific port."""
+        msg         = of.ofp_packet_out()
+        msg.data    = packet_in
+        msg.in_port = packet_in.in_port
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        self.connection.send(msg)
 
-        actions = [parser.OFPActionOutput(out_port)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        )
-        datapath.send_msg(out)
+
+# ------------------------------------------------------------------ #
+#  Component Launch Function (POX entry point)                       #
+# ------------------------------------------------------------------ #
+
+class ARPHandlerLauncher(object):
+    """Listens for new switch connections and spawns an ARPHandler."""
+
+    def __init__(self):
+        core.openflow.addListeners(self)
+        log.info("=" * 55)
+        log.info("  ARP Handler SDN Controller (POX) Started")
+        log.info("=" * 55)
+
+    def _handle_ConnectionUp(self, event):
+        log.info("New switch connected: %s", dpidToStr(event.dpid))
+        ARPHandler(event.connection)
+
+
+def launch():
+    """POX calls this function to start the component."""
+    core.registerNew(ARPHandlerLauncher)
